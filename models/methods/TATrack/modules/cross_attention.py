@@ -27,25 +27,16 @@ class CrossAttention(nn.Module):
         self.attn_pos_encoding_only = attn_pos_encoding_only
 
     def forward(self, q, kv, q_ape, k_ape, attn_pos):
-        '''
-            Args:
-                q (torch.Tensor): (B, L_q, C)
-                kv (torch.Tensor): (B, L_kv, C)
-                q_ape (torch.Tensor | None): (1 or B, L_q, C), absolute positional encoding for q
-                k_ape (torch.Tensor | None): (1 or B, L_kv, C), absolute positional encoding for k
-                attn_pos (torch.Tensor | None): (1 or B, num_heads, L_q, L_kv), untied positional encoding
-            Returns:
-                torch.Tensor: (B, L_q, C)
-        '''
+       
         B, q_N, C = q.shape
         kv_N = kv.shape[1]
 
-        if self.attn_pos_encoding_only:
+        if self.attn_pos_encoding_only: #是否只使用位置编码来计算注意力
             assert q_ape is None and k_ape is None
             q = self.q(q).reshape(B, q_N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             kv = self.kv(kv).reshape(B, kv_N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
             k, v = kv[0], kv[1]
-        else:
+        else:   #查询和键的绝对位置编码（q_ape 和 k_ape）会被加到 q 和 kv 上
             q = q + q_ape if q_ape is not None else q
             q = self.q(q).reshape(B, q_N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             k = kv + k_ape if k_ape is not None else kv
