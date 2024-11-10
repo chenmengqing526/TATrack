@@ -34,7 +34,7 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-
+#将输入张量 x 按照指定的窗口大小（window_size）分割成多个小窗口
 def window_partition(x, window_size):
     """
     Args:
@@ -44,11 +44,11 @@ def window_partition(x, window_size):
         test_d: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)   #每个窗口的尺寸是 (window_size, window_size)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
-
+#将之前分割成小窗口的张量重新组合回原始的图像大小
 def window_reverse(windows, window_size, H, W):
     """
     Args:
@@ -64,14 +64,14 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
-
+#用来表示2D网格中每个token之间的相对位置
 def _generate_2d_relative_position_index(size):
     # get siam_pair-wise relative position index for each token inside the window
     coords_h = torch.arange(size[0])
     coords_w = torch.arange(size[1])
     coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
     coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww  每对位置之间的相对坐标
     relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
     relative_coords[:, :, 0] += size[0] - 1  # shift to start from 0
     relative_coords[:, :, 1] += size[1] - 1
@@ -116,36 +116,37 @@ class WindowAttention(nn.Module):
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
-
+#计算了多头自注意力的过程，并且加入了相对位置编码和mask
     def forward(self, x, mask=None):
         """ Forward function.
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        B_, N, C = x.shape       #x 的形状是 (num_windows * B, N, C) N是一个窗口内的token数量 
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) #通过一个线性层来计算Q、K、V  之后通过reshape和permute 操作
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        q = q * self.scale #缩放查询Q 避免在计算注意力时，查询与键的点积值过大或过小，影响梯度传播
+        attn = (q @ k.transpose(-2, -1)) #查询和键的点积 得到注意力得分
 
+       #添加相对位置编码
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH 
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0) #mask被添加到计算的注意力权重上，这样就可以屏蔽掉一些不需要关注的部分
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
-            attn = self.softmax(attn)
+            attn = self.softmax(attn) #如果没有提供 mask，直接对 attn 应用 softmax 来计算注意力权重
 
-        attn = self.attn_drop(attn)
+        attn = self.attn_drop(attn) #对注意力权重应用 dropout，防止过拟合
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C) #通过注意力矩阵与值（v）进行矩阵乘法，计算加权平均的输出
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -191,14 +192,8 @@ class SwinTransformerBlock(nn.Module):
 
         self.H = None
         self.W = None
-
+#实现了一个局部窗口自注意力机制，并结合了周期性平移
     def forward(self, x, mask_matrix=None):
-        """ Forward function.
-        Args:
-            x: Input feature, tensor size (B, H*W, C).
-            H, W: Spatial resolution of the input feature.
-            mask_matrix: Attention mask for cyclic shift.
-        """
         B, L, C = x.shape
         H, W = self.H, self.W
         assert L == H * W, "input feature has wrong size"
@@ -207,38 +202,38 @@ class SwinTransformerBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        # pad feature maps to multiples of window size
+        # 为了确保输入的空间尺寸（H 和 W）能够被窗口大小整除，进行填充操作
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
         _, Hp, Wp, _ = x.shape
 
-        # cyclic shift
+        # cyclic shift  周期性平移
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)) #平移的步长是 shift_size
             attn_mask = mask_matrix
         else:
             shifted_x = x
             attn_mask = None
 
-        # partition windows
+        # partition windows 分割窗口
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
-        # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
+        # W-MSA/SW-MSA 计算自注意力
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C  得到的结果是每个窗口内经过自注意力计算后的输出
 
-        # merge windows
+        # merge windows 合并窗口
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  #使用window_reverse将这些窗口重新组合成整个特征图，恢复到原来的空间尺寸Hp,Wp
 
-        # reverse cyclic shift
-        if self.shift_size > 0:
+        # reverse cyclic shift 反向周期性平移
+        if self.shift_size > 0: 如果之前进行了周期性平移，这里需要将结果再次平移回去，恢复到原始的位置
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
-
+        #如果对输入特征图进行了填充，最终需要去掉填充的部分，恢复到原始的空间大小 H, W
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
 
@@ -288,7 +283,7 @@ class PatchEmbed(nn.Module):
             trunc_normal_(self.absolute_pos_embed, std=.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
-
+#将图像转换为一定大小的 patches（小块） 并对其进行位置编码处理
     def forward(self, x, H, W):
         """Forward function."""
         # padding
@@ -306,7 +301,7 @@ class PatchEmbed(nn.Module):
             x = self.norm(x)
             x = x.transpose(1, 2).view(-1, self.embed_dim, Wh, Ww)
 
-        if self.ape:
+        if self.ape: #绝对位置嵌入
             # interpolate the position embedding to the corresponding size
             absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
             x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
@@ -329,7 +324,7 @@ class PatchMerging(nn.Module):
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
-
+#图像分块（patching）和融合（shuffling） 操作
     def forward(self, x, H, W):
         """ Forward function.
         Args:
@@ -345,7 +340,7 @@ class PatchMerging(nn.Module):
         pad_input = (H % 2 == 1) or (W % 2 == 1)
         if pad_input:
             x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
-
+        #分成四个不同的小块
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
@@ -354,9 +349,9 @@ class PatchMerging(nn.Module):
         x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
 
         x = self.norm(x)
-        x = self.reduction(x)
+        x = self.reduction(x) #用于特征压缩的层，通常是一个全连接层或卷积层
 
-        Wh, Ww = (H + 1) // 2, (W + 1) // 2
+        Wh, Ww = (H + 1) // 2, (W + 1) // 2 #计算新的高度和宽度
 
         return x, Wh, Ww
 
@@ -417,7 +412,7 @@ class BasicStage(nn.Module):
 
         if pre_stage is not None:
             self.pre_stage = pre_stage
-
+#包括计算自注意力掩码（attention mask） 和 对输入特征进行多个阶段的处理，并通过多个 Transformer Block 进行特征变换
     def forward(self, x, H, W):
         """ Forward function.
         Args:
@@ -428,10 +423,11 @@ class BasicStage(nn.Module):
         if self.pre_stage is not None:
             x, H, W = self.pre_stage(x, H, W)
 
-        # calculate attention mask for SW-MSA
+        #计算窗口大小（Window Size）和图像掩码（Image Mask）
         Hp = int(math.ceil(H / self.window_size)) * self.window_size
         Wp = int(math.ceil(W / self.window_size)) * self.window_size
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        #计算滑动窗口的掩码（Attention Mask）
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
                     slice(-self.shift_size, None))
@@ -440,13 +436,13 @@ class BasicStage(nn.Module):
                     slice(-self.shift_size, None))
         cnt = 0
         for h in h_slices:
-            for w in w_slices:
+            for w in w_slices:#cnt 用于为每个切片分配一个唯一的索引 通过这种方式，img_mask将包含不同区域的掩码，用于指定哪些区域可以进行注意力计算
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1 通过窗口化操作将掩码分成多个窗口 计算窗口内的自注意力
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)#计算注意力掩码，告诉模型哪些区域的注意力应该被“屏蔽”掉
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
         for blk in self.blocks:
